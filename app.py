@@ -1,31 +1,26 @@
-import hashlib
-import hmac
-import json
-import math
-import os
-import secrets as pysecrets
-import sqlite3
-import time
-import uuid
-from datetime import datetime, timedelta, timezone
-
-import folium
-import pandas as pd
-import requests
 import streamlit as st
-from streamlit_folium import st_folium
-
-try:  # اختياري: للتتبع الحي عبر GPS المتصفح
-    from streamlit_js_eval import get_geolocation
-except Exception:
-    get_geolocation = None
 
 st.set_page_config(
     page_title="شعْتَلة",
     page_icon="🚌",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
+
+from streamlit_folium import st_folium
+import folium
+import json
+import math
+import os
+import time
+import requests
+import sqlite3
+
+try:
+    import libsql_client
+    HAS_TURSO = True
+except ImportError:
+    HAS_TURSO = False
 
 st.markdown("""
 <style>
@@ -35,14 +30,24 @@ html, body, [class*="css"] {
     direction: rtl;
     text-align: right;
 }
-.stMetric { background-color: #f8f9fa; border-radius: 8px; padding: 10px; }
+.stMetric {
+    background-color: #f8f9fa;
+    border-radius: 8px;
+    padding: 10px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ───────────────────────── ثوابت ─────────────────────────
-JO_TZ = timezone(timedelta(hours=3))
-JORDAN_BOUNDS = {"min_lat": 29.18, "max_lat": 33.38, "min_lon": 34.90, "max_lon": 39.30}
-DB_PATH = os.environ.get("MASAR_DB", "masar_database.db")
+JORDAN_BOUNDS = {
+    'min_lat': 29.18,
+    'max_lat': 33.38,
+    'min_lon': 34.90,
+    'max_lon': 39.30
+}
+
+def is_within_jordan(lat, lon):
+    return (JORDAN_BOUNDS['min_lat'] <= lat <= JORDAN_BOUNDS['max_lat']) and \
+           (JORDAN_BOUNDS['min_lon'] <= lon <= JORDAN_BOUNDS['max_lon'])
 
 DEFAULT_HUBS = [
     ("مجمع الشمال (إربد)", 32.5562, 35.8498),
@@ -59,497 +64,311 @@ DEFAULT_HUBS = [
     ("مجمع الأمير راشد (الزرقاء)", 32.0620, 36.0880),
     ("جامعة آل البيت (المفرق)", 32.3420, 36.2390),
     ("جامعة فيلادلفيا", 32.1765, 35.8450),
-    ("جامعة جرش الأهلية", 32.2530, 35.8920),
+    ("جامعة جرش الأهلية", 32.2530, 35.8920)
 ]
 
 UNIVERSITIES = [
-    "جامعة اليرموك", "الجامعة الأردنية", "جامعة العلوم والتكنولوجيا",
-    "جامعة البلقاء التطبيقية", "الجامعة الهاشمية", "جامعة آل البيت", "أخرى",
+    "جامعة اليرموك", 
+    "الجامعة الأردنية", 
+    "جامعة العلوم والتكنولوجيا", 
+    "جامعة البلقاء التطبيقية", 
+    "الجامعة الهاشمية", 
+    "جامعة آل البيت", 
+    "أخرى"
 ]
 
-PAGE_TRACK, PAGE_SUGGEST, PAGE_ADMIN = "تتبع ومسارات الباصات", "اقتراح خط جديد", "بوابة الإدارة"
-MODE_VIEW, MODE_SIM, MODE_LOCATE = "🗺️ عرض المسار", "🚍 محاكاة حركة الباص", "📍 تتبع موقعي على المسار"
-IN_HUBS, IN_PINS = "اختيار محطات ومجمعات جاهزة", "تثبيت الدبوس يدوياً على الخريطة"
+def use_turso():
+    return HAS_TURSO and ("TURSO_DATABASE_URL" in st.secrets) and ("TURSO_AUTH_TOKEN" in st.secrets)
 
-
-def now_str():
-    return datetime.now(JO_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def is_within_jordan(lat, lon):
-    return (JORDAN_BOUNDS["min_lat"] <= lat <= JORDAN_BOUNDS["max_lat"]
-            and JORDAN_BOUNDS["min_lon"] <= lon <= JORDAN_BOUNDS["max_lon"])
-
-
-# ───────────────────────── قاعدة البيانات ─────────────────────────
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect("masar_database.db", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+def db_execute(query, params=(), fetchall=False, commit=False):
+    if use_turso():
+        client = libsql_client.create_client_sync(
+            url=st.secrets["TURSO_DATABASE_URL"],
+            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
+        )
+        q_clean = query.replace("?", "$?")
+        res = client.execute(query, params)
+        if fetchall:
+            cols = res.columns
+            return [dict(zip(cols, row)) for row in res.rows]
+        return None
+    else:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(query, params)
+        data = None
+        if commit:
+            conn.commit()
+        if fetchall:
+            rows = c.fetchall()
+            data = [dict(r) for r in rows]
+        conn.close()
+        return data
 
-@st.cache_resource
 def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS routes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            route_name TEXT NOT NULL,
-            university TEXT NOT NULL,
-            fare REAL NOT NULL,
-            distance_km REAL,
-            duration_min REAL,
-            coordinates TEXT NOT NULL,
-            notes TEXT,
-            status TEXT DEFAULT 'approved'
-        )""")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS hubs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            lat REAL NOT NULL,
-            lon REAL NOT NULL
-        )""")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            pw_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            created_at TEXT
-        )""")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            event TEXT NOT NULL,
-            detail TEXT
-        )""")
-    # ترقية قواعد البيانات القديمة
-    cols = {r["name"] for r in c.execute("PRAGMA table_info(routes)").fetchall()}
-    if "stops" not in cols:
-        c.execute("ALTER TABLE routes ADD COLUMN stops TEXT")
-    if "geometry_source" not in cols:
-        c.execute("ALTER TABLE routes ADD COLUMN geometry_source TEXT DEFAULT 'osrm'")
-    conn.commit()
-    if c.execute("SELECT COUNT(*) FROM hubs").fetchone()[0] == 0:
-        c.executemany("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", DEFAULT_HUBS)
+    if use_turso():
+        client = libsql_client.create_client_sync(
+            url=st.secrets["TURSO_DATABASE_URL"],
+            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
+        )
+        client.execute("""
+            CREATE TABLE IF NOT EXISTS routes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route_name TEXT NOT NULL,
+                university TEXT NOT NULL,
+                fare REAL NOT NULL,
+                distance_km REAL,
+                duration_min REAL,
+                coordinates TEXT NOT NULL,
+                notes TEXT,
+                status TEXT DEFAULT 'approved'
+            )
+        """)
+        client.execute("""
+            CREATE TABLE IF NOT EXISTS hubs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL
+            )
+        """)
+        res = client.execute("SELECT COUNT(*) FROM hubs")
+        if res.rows[0][0] == 0:
+            for h in DEFAULT_HUBS:
+                client.execute("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", h)
+    else:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS routes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route_name TEXT NOT NULL,
+                university TEXT NOT NULL,
+                fare REAL NOT NULL,
+                distance_km REAL,
+                duration_min REAL,
+                coordinates TEXT NOT NULL,
+                notes TEXT,
+                status TEXT DEFAULT 'approved'
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS hubs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL
+            )
+        """)
         conn.commit()
-    conn.close()
-    return True
-
+        c.execute("SELECT COUNT(*) FROM hubs")
+        if c.fetchone()[0] == 0:
+            c.executemany("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", DEFAULT_HUBS)
+            conn.commit()
+        conn.close()
 
 init_db()
 
-
-def db_execute(query, params=(), fetchall=False, commit=False):
-    conn = get_db()
-    try:
-        cur = conn.execute(query, params)
-        rows = [dict(r) for r in cur.fetchall()] if fetchall else None
-        if commit:
-            conn.commit()
-        return rows
-    finally:
-        conn.close()
-
-
-# ── المجمعات ──
 def get_all_hubs():
-    rows = db_execute("SELECT * FROM hubs ORDER BY id", fetchall=True) or []
-    return {r["name"]: (r["lat"], r["lon"]) for r in rows}
-
+    rows = db_execute("SELECT * FROM hubs ORDER BY id ASC", fetchall=True) or []
+    return {r['name']: (r['lat'], r['lon']) for r in rows}
 
 def upsert_hub(name, lat, lon):
+    if use_turso():
+        client = libsql_client.create_client_sync(
+            url=st.secrets["TURSO_DATABASE_URL"],
+            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
+        )
+        client.execute("""
+            INSERT INTO hubs (name, lat, lon) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon
+        """, (name, float(lat), float(lon)))
+    else:
+        db_execute("""
+            INSERT INTO hubs (name, lat, lon) VALUES (?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon
+        """, (name, float(lat), float(lon)), commit=True)
+
+def get_routes(status='approved'):
+    return db_execute("SELECT * FROM routes WHERE status = ?", (status,), fetchall=True) or []
+
+def add_route(route_name, university, fare, distance_km, duration_min, coords_json, notes, status='approved'):
     db_execute("""
-        INSERT INTO hubs (name, lat, lon) VALUES (?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon
-    """, (name, float(lat), float(lon)), commit=True)
+        INSERT INTO routes (route_name, university, fare, distance_km, duration_min, coordinates, notes, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (route_name, university, fare, distance_km, duration_min, coords_json, notes, status), commit=True)
 
-
-# ── الخطوط ──
-def get_routes(status="approved"):
-    return db_execute("SELECT * FROM routes WHERE status = ? ORDER BY id", (status,), fetchall=True) or []
-
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    r = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _osrm(points):
-    """يرمي استثناءً عند الفشل، وبالتالي لا يُخزَّن الفشل في الكاش."""
-    coords_str = ";".join(f"{lon},{lat}" for lat, lon in points)
-    res = requests.get(
-        f"https://router.project-osrm.org/route/v1/driving/{coords_str}",
-        params={"overview": "full", "geometries": "geojson"}, timeout=8,
-    )
-    res.raise_for_status()
-    data = res.json()
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise ValueError("no route")
-    r = data["routes"][0]
-    return (round(r["distance"] / 1000.0, 2), round(r["duration"] / 60.0, 1),
-            [[p[1], p[0]] for p in r["geometry"]["coordinates"]])
-
-
-def compute_route(points):
-    """points: قائمة (lat, lon) بالترتيب: انطلاق، محطات وسيطة، وصول."""
-    pts = tuple((round(float(a), 6), round(float(b), 6)) for a, b in points)
-    try:
-        d, t, c = _osrm(pts)
-        return {"distance": d, "duration": t, "coords": c, "source": "osrm"}
-    except Exception:
-        d = round(sum(haversine_km(*pts[i], *pts[i + 1]) for i in range(len(pts) - 1)), 2)
-        return {"distance": d, "duration": round(d / 40.0 * 60, 1),
-                "coords": [list(p) for p in pts], "source": "straight"}
-
-
-def save_route(name, university, fare, stops, notes, status):
-    geo = compute_route([(s["lat"], s["lon"]) for s in stops])
-    db_execute("""
-        INSERT INTO routes (route_name, university, fare, distance_km, duration_min,
-                            coordinates, notes, status, stops, geometry_source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (name, university, float(fare), geo["distance"], geo["duration"],
-          json.dumps(geo["coords"]), notes, status,
-          json.dumps(stops, ensure_ascii=False), geo["source"]), commit=True)
-    return geo["source"]
-
-
-def recalc_route(route):
-    """يعيد حساب المسار بإحداثيات المجمعات الحالية. يرجع مصدر الهندسة أو None."""
-    if not route.get("stops"):
-        return None
-    hubs = get_all_hubs()
-    stops = json.loads(route["stops"])
-    for s in stops:
-        if s.get("name") in hubs:
-            s["lat"], s["lon"] = hubs[s["name"]]
-    geo = compute_route([(s["lat"], s["lon"]) for s in stops])
-    db_execute("""
-        UPDATE routes SET distance_km=?, duration_min=?, coordinates=?, stops=?, geometry_source=?
-        WHERE id=?
-    """, (geo["distance"], geo["duration"], json.dumps(geo["coords"]),
-          json.dumps(stops, ensure_ascii=False), geo["source"], int(route["id"])), commit=True)
-    return geo["source"]
-
-
-def recalc_routes_using_hub(hub_name):
-    n = 0
-    for status in ("approved", "pending"):
-        for r in get_routes(status):
-            if r.get("stops") and any(s.get("name") == hub_name for s in json.loads(r["stops"])):
-                recalc_route(r)
-                n += 1
-    return n
-
-
-def update_route(route_id, name, fare, notes):
-    db_execute("UPDATE routes SET route_name=?, fare=?, notes=? WHERE id=?",
-               (str(name), float(fare), str(notes or ""), int(route_id)), commit=True)
-
+def update_route_fare_and_details(route_id, new_fare, new_name=None, new_notes=None):
+    if new_name and new_notes is not None:
+        db_execute("""
+            UPDATE routes 
+            SET fare = ?, route_name = ?, notes = ?
+            WHERE id = ?
+        """, (float(new_fare), str(new_name), str(new_notes), int(route_id)), commit=True)
+    else:
+        db_execute("UPDATE routes SET fare = ? WHERE id = ?", (float(new_fare), int(route_id)), commit=True)
 
 def set_route_status(route_id, status, fare=None):
     if fare is not None:
-        db_execute("UPDATE routes SET status=?, fare=? WHERE id=?", (status, float(fare), int(route_id)), commit=True)
+        db_execute("UPDATE routes SET status = ?, fare = ? WHERE id = ?", (status, float(fare), int(route_id)), commit=True)
     else:
-        db_execute("UPDATE routes SET status=? WHERE id=?", (status, int(route_id)), commit=True)
-
+        db_execute("UPDATE routes SET status = ? WHERE id = ?", (status, int(route_id)), commit=True)
 
 def delete_route(route_id):
-    db_execute("DELETE FROM routes WHERE id=?", (int(route_id),), commit=True)
+    db_execute("DELETE FROM routes WHERE id = ?", (int(route_id),), commit=True)
 
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
 
-# ── الأحداث والإحصائيات ──
-def log_event(event, detail=""):
+@st.cache_data(ttl=3600)
+def fetch_osrm_route(start_lat, start_lon, end_lat, end_lon):
     try:
-        db_execute("INSERT INTO events (ts, session_id, event, detail) VALUES (?, ?, ?, ?)",
-                   (now_str(), st.session_state.sid, event, str(detail)), commit=True)
+        url = f"https://router.project-osrm.org/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}?overview=full&geometries=geojson"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('routes'):
+                r = data['routes'][0]
+                dist = round(r['distance'] / 1000.0, 2)
+                dur = round(r['duration'] / 60.0, 1)
+                coords = [[pt[1], pt[0]] for pt in r['geometry']['coordinates']]
+                return dist, dur, coords
     except Exception:
         pass
+    dist = round(haversine_km(start_lat, start_lon, end_lat, end_lon), 2)
+    dur = round((dist / 40.0) * 60, 1)
+    return dist, dur, [[start_lat, start_lon], [end_lat, end_lon]]
 
+# الشريط الجانبي
+st.sidebar.image("https://img.icons8.com/color/96/bus.png", width=70)
+st.sidebar.title("شعْتَلة 🚌")
+st.sidebar.caption("مسارات باصات الجامعات الأردنية")
 
-# ── المشرفون وكلمات المرور ──
-def hash_pw(pw, salt=None):
-    salt = salt or pysecrets.token_hex(16)
-    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000).hex()
-    return h, salt
+app_mode = st.sidebar.radio("التنقل:", ["تتبع ومسارات الباصات", "اقتراح خط جديد", "بوابة الإدارة"])
+hubs_dict = get_all_hubs()
 
-
-def verify_pw(pw, pw_hash, salt):
-    return hmac.compare_digest(hash_pw(pw, salt)[0], pw_hash)
-
-
-def get_master_secret():
-    try:
-        v = st.secrets["ADMIN_PASSWORD"]
-        if v:
-            return str(v)
-    except Exception:
-        pass
-    return os.environ.get("ADMIN_PASSWORD", "")
-
-
-def list_admins():
-    return db_execute("SELECT id, username, created_at FROM admins ORDER BY id", fetchall=True) or []
-
-
-def get_admin(username):
-    rows = db_execute("SELECT * FROM admins WHERE username = ?", (username,), fetchall=True)
-    return rows[0] if rows else None
-
-
-def add_admin(username, pw):
-    if get_admin(username):
-        return False
-    h, s = hash_pw(pw)
-    db_execute("INSERT INTO admins (username, pw_hash, salt, created_at) VALUES (?, ?, ?, ?)",
-               (username, h, s, now_str()), commit=True)
-    return True
-
-
-def set_admin_pw(username, pw):
-    h, s = hash_pw(pw)
-    db_execute("UPDATE admins SET pw_hash=?, salt=? WHERE username=?", (h, s, username), commit=True)
-
-
-def delete_admin(username):
-    db_execute("DELETE FROM admins WHERE username=?", (username,), commit=True)
-
-
-# ───────────────────────── الخرائط ─────────────────────────
-def base_map(center=(31.95, 35.93), zoom=8):
-    return folium.Map(location=list(center), zoom_start=zoom, tiles="CartoDB positron")
-
-
-def add_hub_markers(m, hubs, highlight=None):
-    for n, (la, lo) in hubs.items():
-        on = n == highlight
-        folium.CircleMarker(
-            [la, lo], radius=9 if on else 6, color="#d9534f" if on else "#2A75D3",
-            fill=True, fill_opacity=0.85, tooltip=n,
-        ).add_to(m)
-
-
-def route_map(coords, stops=None, dest_label="الوجهة", bus_idx=None, user_pos=None):
-    m = folium.Map(location=coords[0], zoom_start=12, tiles="CartoDB positron")
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    if user_pos:
-        lats.append(user_pos[0])
-        lons.append(user_pos[1])
-    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
-    folium.PolyLine(coords, color="#2A75D3", weight=5, opacity=0.85).add_to(m)
-
-    if stops and len(stops) > 2:
-        for s in stops[1:-1]:
-            folium.CircleMarker([s["lat"], s["lon"]], radius=6, color="#f0ad4e", fill=True,
-                                fill_opacity=0.9, tooltip=s.get("name") or "محطة وسيطة").add_to(m)
-
-    s_pos = [stops[0]["lat"], stops[0]["lon"]] if stops else coords[0]
-    e_pos = [stops[-1]["lat"], stops[-1]["lon"]] if stops else coords[-1]
-    s_name = (stops[0].get("name") if stops else None) or "نقطة الانطلاق"
-    e_name = (stops[-1].get("name") if stops else None) or dest_label
-    folium.Marker(s_pos, tooltip=s_name, icon=folium.Icon(color="green", icon="play")).add_to(m)
-    folium.Marker(e_pos, tooltip=e_name, icon=folium.Icon(color="red", icon="flag")).add_to(m)
-
-    if bus_idx is not None:
-        folium.Marker(coords[bus_idx], tooltip="موقع الباص الحالي",
-                      icon=folium.Icon(color="orange", icon="bus", prefix="fa")).add_to(m)
-    if user_pos:
-        folium.Marker(user_pos, tooltip="موقعك",
-                      icon=folium.Icon(color="blue", icon="user", prefix="fa")).add_to(m)
-    return m
-
-
-def new_click(map_data, seen_key):
-    """يرجع نقرة جديدة فقط (يتجاهل آخر نقرة قديمة محفوظة في المكوّن)."""
-    lc = (map_data or {}).get("last_clicked")
-    if not lc:
-        return None
-    t = (round(lc["lat"], 7), round(lc["lng"], 7))
-    if st.session_state.get(seen_key) == t:
-        return None
-    st.session_state[seen_key] = t
-    return [lc["lat"], lc["lng"]]
-
-
-def locate_on_route(coords, lat, lon):
-    """أقرب نقطة على المسار (إسقاط على القطع المستقيمة). يرجع (البعد كم، المسافة المقطوعة كم، الطول الكلي كم)."""
-    cum = [0.0]
-    for i in range(len(coords) - 1):
-        cum.append(cum[-1] + haversine_km(*coords[i], *coords[i + 1]))
-    kx, ky = 111.320 * math.cos(math.radians(lat)), 110.574
-    best_d, best_along = 1e9, 0.0
-    for i in range(len(coords) - 1):
-        ax, ay = (coords[i][1] - lon) * kx, (coords[i][0] - lat) * ky
-        bx, by = (coords[i + 1][1] - lon) * kx, (coords[i + 1][0] - lat) * ky
-        dx, dy = bx - ax, by - ay
-        seg2 = dx * dx + dy * dy
-        t = 0.0 if seg2 == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / seg2))
-        d = math.hypot(ax + t * dx, ay + t * dy)
-        if d < best_d:
-            best_d, best_along = d, cum[i] + t * (cum[i + 1] - cum[i])
-    return best_d, best_along, cum[-1]
-
-
-def show_progress(route, coords, lat, lon):
-    off, along, total = locate_on_route(coords, lat, lon)
-    frac = min(1.0, max(0.0, along / total)) if total > 0 else 0.0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("المسار المنجز", f"{frac * 100:.0f}%")
-    c2.metric("المسافة المتبقية", f"{(route['distance_km'] or 0) * (1 - frac):.1f} كم")
-    c3.metric("الزمن المتبقي", f"{(route['duration_min'] or 0) * (1 - frac):.0f} دقيقة")
-    st.progress(frac)
-    if off > 0.3:
-        st.warning(f"موقعك يبعد حوالي {off * 1000:.0f} متراً عن المسار.")
-    else:
-        st.success("أنت على المسار ✅")
-
-
-# ───────────────────────── صفحة التتبع ─────────────────────────
-def page_tracking():
-    st.title("🗺️ استعراض وتتبع مسار الباص")
-    routes = get_routes("approved")
+# 1. شاشة استعراض ومحاكاة تتبع حركة الباص
+if app_mode == "تتبع ومسارات الباصات":
+    st.title("🗺️ استعراض وتتبع مسار الباص مباشرة")
+    
+    routes = get_routes('approved')
     if not routes:
         st.info("لا توجد مسارات مسجلة حالياً. يمكنك اقتراح مسار جديد من القائمة الجانبية.")
-        return
+    else:
+        col_sel, col_stat = st.columns([2, 1])
+        with col_sel:
+            r_names = {f"{r['route_name']} ({r['university']})": r for r in routes}
+            chosen_label = st.selectbox("اختر المسار للاستعراض والتتبع:", list(r_names.keys()))
+            cur_route = r_names[chosen_label]
+        
+        with col_stat:
+            st.metric("الأجرة المعتمدة", f"{cur_route['fare']:.2f} د.أ")
+            st.metric("المسافة التقديرية", f"{cur_route['distance_km']} كم")
+            st.caption(f"⏱️ زمن الرحلة التقريبي: {cur_route['duration_min']} دقيقة")
+            if cur_route.get('notes'):
+                st.info(f"ملاحظات: {cur_route['notes']}")
 
-    labels = {f"{r['route_name']} ({r['university']})": r for r in routes}
-    route = labels[st.selectbox("اختر المسار:", list(labels.keys()))]
+        coords = json.loads(cur_route['coordinates'])
+        
+        c_sim1, c_sim2 = st.columns([1, 3])
+        with c_sim1:
+            run_tracking = st.button("🚍 محاكاة تتبع حركة الباص من الانطلاق")
+        
+        map_placeholder = st.empty()
+        
+        def render_bus_map(bus_position_idx=0):
+            m = folium.Map(location=coords[0], zoom_start=12, tiles="CartoDB positron")
+            folium.PolyLine(coords, color="#2A75D3", weight=5, opacity=0.8).add_to(m)
+            folium.Marker(coords[0], tooltip="نقطة الانطلاق", icon=folium.Icon(color="green", icon="play")).add_to(m)
+            folium.Marker(coords[-1], tooltip=cur_route['university'], icon=folium.Icon(color="red", icon="flag")).add_to(m)
+            
+            bus_loc = coords[bus_position_idx]
+            folium.Marker(
+                bus_loc,
+                tooltip="موقع الباص الحالي",
+                icon=folium.Icon(color="orange", icon="bus", prefix="fa")
+            ).add_to(m)
+            return m
 
-    if st.session_state.get("last_route_logged") != route["id"]:
-        st.session_state.last_route_logged = route["id"]
-        st.session_state.manual_pos = None
-        log_event("route_view", route["id"])
-
-    coords = json.loads(route["coordinates"])
-    stops = json.loads(route["stops"]) if route.get("stops") else None
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("الأجرة المعتمدة", f"{route['fare']:.2f} د.أ")
-    c2.metric("المسافة التقديرية", f"{route['distance_km']} كم")
-    c3.metric("زمن الرحلة التقريبي", f"{route['duration_min']} دقيقة")
-    if route.get("notes"):
-        st.info(f"ملاحظات: {route['notes']}")
-    if route.get("geometry_source") == "straight":
-        st.warning("هذا المسار معروض كخط مستقيم تقريبي لتعذّر الاتصال بخدمة الطرق. سيقوم المشرف بتحديثه.")
-
-    mode = st.radio("الوضع:", [MODE_VIEW, MODE_SIM, MODE_LOCATE], horizontal=True)
-
-    if mode == MODE_VIEW:
-        st_folium(route_map(coords, stops, route["university"]), width=900, height=480,
-                  key=f"view_{route['id']}", returned_objects=[])
-
-    elif mode == MODE_SIM:
-        ph = st.empty()
-
-        def draw(idx, key):
-            with ph.container():
-                st_folium(route_map(coords, stops, route["university"], bus_idx=idx),
-                          width=900, height=450, key=key, returned_objects=[])
-
-        if st.button("▶️ ابدأ المحاكاة"):
-            log_event("simulation", route["id"])
-            n = min(len(coords), 25)
-            idxs = sorted({int(i * (len(coords) - 1) / (n - 1)) for i in range(n)})
-            bar, txt = st.progress(0), st.empty()
-            for k, idx in enumerate(idxs):
-                pct = int((k + 1) / len(idxs) * 100)
-                bar.progress(pct)
-                rem = max(0.0, round((route["duration_min"] or 0) * (1 - pct / 100.0), 1))
-                txt.markdown(f"**الباص في الطريق 🚍** | المنجز: **{pct}%** | المتبقي: **{rem} دقيقة**")
-                draw(idx, f"sim_{route['id']}_{k}")
-                time.sleep(0.5)
-            st.success("🏁 وصل الباص إلى المحطة النهائية!")
+        if run_tracking:
+            prog_bar = st.progress(0)
+            status_text = st.empty()
+            step_stride = max(1, len(coords) // 10)
+            sim_points = list(range(0, len(coords), step_stride))
+            if sim_points[-1] != len(coords) - 1:
+                sim_points.append(len(coords) - 1)
+            
+            for idx, pt_idx in enumerate(sim_points):
+                pct = int(((idx + 1) / len(sim_points)) * 100)
+                prog_bar.progress(pct)
+                rem_mins = max(0.0, round(cur_route['duration_min'] * (1 - (pct / 100.0)), 1))
+                status_text.markdown(f"**حالة الرحلة:** الباص في الطريق 🚍 | المسار المنجز: **{pct}%** | الزمن المتبقي للوصول: **{rem_mins} دقيقة**")
+                with map_placeholder.container():
+                    st_folium(render_bus_map(pt_idx), width=900, height=450, key=f"sim_{pt_idx}")
+                time.sleep(0.6)
+            st.success("🏁 وصل الباص إلى المحطة النهائية بنجاح!")
         else:
-            draw(0, f"sim_idle_{route['id']}")
+            with map_placeholder.container():
+                st_folium(render_bus_map(0), width=900, height=450, key="static_map")
 
-    else:  # تتبع موقع المستخدم
-        method = st.radio("طريقة تحديد موقعك:", ["GPS من المتصفح", "النقر على الخريطة"], horizontal=True)
-        pos = None
-        if method == "GPS من المتصفح":
-            if get_geolocation is None:
-                st.warning("لتفعيل GPS ثبّت الحزمة: pip install streamlit-js-eval (ويلزم اتصال HTTPS). "
-                           "يمكنك الآن استخدام خيار النقر على الخريطة.")
-            else:
-                if st.button("🔄 تحديث موقعي"):
-                    st.session_state.geo_n = st.session_state.get("geo_n", 0) + 1
-                loc = get_geolocation(component_key=f"geo_{st.session_state.get('geo_n', 0)}")
-                if loc and loc.get("coords"):
-                    pos = [loc["coords"]["latitude"], loc["coords"]["longitude"]]
-                    acc = loc["coords"].get("accuracy")
-                    if acc:
-                        st.caption(f"دقة GPS التقريبية: ±{acc:.0f} متر")
-                else:
-                    st.info("بانتظار السماح للمتصفح بالوصول إلى موقعك...")
-            if pos:
-                if not st.session_state.get("locate_logged"):
-                    st.session_state.locate_logged = True
-                    log_event("locate", route["id"])
-                show_progress(route, coords, *pos)
-            st_folium(route_map(coords, stops, route["university"], user_pos=pos), width=900, height=450,
-                      key=f"gps_{route['id']}", returned_objects=[])
-        else:
-            st.caption("انقر على الخريطة في المكان الذي تقف فيه (أو ينتظر الباص).")
-            data = st_folium(route_map(coords, stops, route["university"], user_pos=st.session_state.get("manual_pos")),
-                             width=900, height=450, key=f"manual_{route['id']}", returned_objects=["last_clicked"])
-            click = new_click(data, "manual_click_seen")
-            if click:
-                st.session_state.manual_pos = click
-                st.rerun()
-            pos = st.session_state.get("manual_pos")
-            if pos:
-                show_progress(route, coords, *pos)
-
-
-# ───────────────────────── صفحة الاقتراح ─────────────────────────
-def page_suggest():
+# 2. شاشة اقتراح خط جديد
+elif app_mode == "اقتراح خط جديد":
     st.title("➕ اقتراح مسار باص جديد")
-    hubs = get_all_hubs()
-    if "pins" not in st.session_state:
-        st.session_state.pins = {"start": None, "end": None, "via": []}
-    pins = st.session_state.pins
+    st.write("يمكنك تحديد المحطات من القوائم الجاهزة، أو **النقر المباشر على الخريطة لتثبيت دبوس البداية والنهاية** بدقة.")
 
-    input_type = st.radio("طريقة تحديد المواقع:", [IN_HUBS, IN_PINS], horizontal=True)
+    if "user_start_pin" not in st.session_state:
+        st.session_state.user_start_pin = None
+    if "user_end_pin" not in st.session_state:
+        st.session_state.user_end_pin = None
 
-    if input_type == IN_PINS:
-        st.caption("انقر لتثبيت نقطة الانطلاق (أخضر)، ثم الوصول (أحمر). أي نقرات إضافية تُضاف كمحطات وسيطة بالترتيب (برتقالي).")
-        m = base_map()
-        add_hub_markers(m, hubs)
-        if pins["start"]:
-            folium.Marker(pins["start"], tooltip="الانطلاق", icon=folium.Icon(color="green")).add_to(m)
-        for i, v in enumerate(pins["via"], 1):
-            folium.Marker(v, tooltip=f"محطة وسيطة {i}", icon=folium.Icon(color="orange")).add_to(m)
-        if pins["end"]:
-            folium.Marker(pins["end"], tooltip="الوصول", icon=folium.Icon(color="red")).add_to(m)
+    c_mode1, c_mode2 = st.columns(2)
+    with c_mode1:
+        input_type = st.radio("طريقة تحديد المواقع:", ["اختيار محطات ومجمعات جاهزة", "تثبيت الدبوس يدوياً على الخريطة"], horizontal=True)
 
-        data = st_folium(m, width=900, height=380, key="pin_map", returned_objects=["last_clicked"])
-        click = new_click(data, "pin_click_seen")
-        if click:
-            if not pins["start"]:
-                pins["start"] = click
-            elif not pins["end"]:
-                pins["end"] = click
-            else:
-                pins["via"].append(click)
-            st.rerun()
+    s_lat, s_lon, e_lat, e_lon = None, None, None, None
 
-        cr, cp = st.columns([1, 3])
-        with cr:
-            if st.button("🔄 إعادة ضبط الدبابيس"):
-                st.session_state.pins = {"start": None, "end": None, "via": []}
+    if input_type == "تثبيت الدبوس يدوياً على الخريطة":
+        st.caption("👇 انقر على الخريطة لتثبيت الدبوس الأخضر (بداية)، ثم انقر مرة أخرى لتثبيت الدبوس الأحمر (وجهة):")
+        
+        pin_map = folium.Map(location=[32.2, 35.9], zoom_start=9, tiles="CartoDB positron")
+        if st.session_state.user_start_pin:
+            folium.Marker(st.session_state.user_start_pin, tooltip="نقطة البداية المحددة", icon=folium.Icon(color="green")).add_to(pin_map)
+        if st.session_state.user_end_pin:
+            folium.Marker(st.session_state.user_end_pin, tooltip="نقطة الوصول المحددة", icon=folium.Icon(color="red")).add_to(pin_map)
+        
+        map_clicks = st_folium(pin_map, width=900, height=350, key="click_map_suggest")
+        
+        if map_clicks and map_clicks.get("last_clicked"):
+            click_pt = [map_clicks["last_clicked"]["lat"], map_clicks["last_clicked"]["lng"]]
+            if not st.session_state.user_start_pin:
+                st.session_state.user_start_pin = click_pt
                 st.rerun()
-        with cp:
-            st.write(f"🟢 الانطلاق: {'تم' if pins['start'] else '—'} | 🔴 الوصول: {'تم' if pins['end'] else '—'} "
-                     f"| 🟠 محطات وسيطة: {len(pins['via'])}")
+            elif not st.session_state.user_end_pin:
+                st.session_state.user_end_pin = click_pt
+                st.rerun()
+
+        col_rst, col_pins = st.columns([1, 3])
+        with col_rst:
+            if st.button("🔄 إعادة ضبط وتعديل الدبابيس"):
+                st.session_state.user_start_pin = None
+                st.session_state.user_end_pin = None
+                st.rerun()
+        with col_pins:
+            if st.session_state.user_start_pin:
+                st.success("🟢 تم تثبيت دبوس نقطة الانطلاق.")
+            if st.session_state.user_end_pin:
+                st.success("🔴 تم تثبيت دبوس نقطة الوصول.")
 
     with st.form("suggest_form"):
         c1, c2 = st.columns(2)
@@ -557,407 +376,232 @@ def page_suggest():
             name = st.text_input("اسم الخط (مثال: مجمع الأغوار - جامعة اليرموك):")
             uni = st.selectbox("الجامعة الوجهة:", UNIVERSITIES)
         with c2:
-            fare = st.number_input("الأجرة المتوقعة (د.أ):", min_value=0.10, value=0.50, step=0.05, format="%.2f")
+            suggested_fare = st.number_input("الأجرة المتوقعة (د.أ):", min_value=0.10, value=0.50, step=0.05, format="%.2f")
             notes = st.text_area("أماكن التوقف أو ملاحظات:")
-        if input_type == IN_HUBS:
-            names = list(hubs.keys())
+
+        if input_type == "اختيار محطات ومجمعات جاهزة":
+            hub_list = list(hubs_dict.keys())
             cc1, cc2 = st.columns(2)
             with cc1:
-                start_hub = st.selectbox("نقطة الانطلاق:", names, index=0)
+                start_hub = st.selectbox("نقطة الانطلاق:", hub_list, index=0)
             with cc2:
-                end_hub = st.selectbox("نقطة الوصول:", names, index=min(2, len(names) - 1))
-            via_hubs = st.multiselect("محطات وسيطة (اختياري، بالترتيب):", names)
+                end_hub = st.selectbox("نقطة الوصول:", hub_list, index=min(2, len(hub_list)-1))
+
         submitted = st.form_submit_button("إرسال المقترح للإدارة")
-
-    if not submitted:
-        return
-    if not name.strip():
-        st.warning("يرجى إدخال اسم المسار.")
-        return
-    if input_type == IN_HUBS:
-        if start_hub == end_hub:
-            st.error("نقطة الانطلاق والوصول متطابقتان.")
-            return
-        chosen = [start_hub] + via_hubs + [end_hub]
-        stops = [{"name": n, "lat": hubs[n][0], "lon": hubs[n][1]} for n in chosen]
-    else:
-        if not (pins["start"] and pins["end"]):
-            st.error("يرجى تثبيت دبوس الانطلاق ودبوس الوصول على الخريطة.")
-            return
-        pts = [pins["start"]] + pins["via"] + [pins["end"]]
-        stops = [{"name": None, "lat": p[0], "lon": p[1]} for p in pts]
-    if not all(is_within_jordan(s["lat"], s["lon"]) for s in stops):
-        st.error("❌ إحدى النقاط تقع خارج حدود الأردن.")
-        return
-
-    with st.spinner("جارٍ حساب المسار على الطرق..."):
-        src = save_route(name.strip(), uni, fare, stops, notes, "pending")
-    st.session_state.pins = {"start": None, "end": None, "via": []}
-    st.success("✅ تم إرسال المقترح لمراجعة الإدارة.")
-    if src == "straight":
-        st.warning("تعذّر الاتصال بخدمة الطرق؛ سيُحسب المسار بدقة عند مراجعة المشرف.")
-
-
-# ───────────────────────── بوابة الإدارة ─────────────────────────
-def admin_login():
-    st.title("🔒 بوابة الإدارة والتحكم")
-    master_secret = get_master_secret()
-    role = st.radio("رتبة الدخول:", ["مساعد آدمن (Assistant)", "الآدمن الرئيسي (Master Admin)"], horizontal=True)
-    is_master = role.startswith("الآدمن")
-    if is_master and not master_secret:
-        st.error("لم يتم ضبط ADMIN_PASSWORD في secrets.toml أو متغيرات البيئة، لذا لا يمكن دخول الآدمن الرئيسي.")
-    username = "" if is_master else st.text_input("اسم المستخدم:")
-    pwd = st.text_input("كلمة المرور:", type="password")
-
-    now = time.time()
-    lock_left = int(st.session_state.get("lock_until", 0) - now)
-    if lock_left > 0:
-        st.error(f"محاولات خاطئة كثيرة. انتظر {lock_left} ثانية.")
-    if st.button("تسجيل الدخول", disabled=lock_left > 0):
-        ok = False
-        if is_master:
-            ok = bool(master_secret) and hmac.compare_digest(pwd.encode(), master_secret.encode())
-        else:
-            row = get_admin(username.strip())
-            ok = bool(row) and verify_pw(pwd, row["pw_hash"], row["salt"])
-        if ok:
-            st.session_state.admin_role = "master" if is_master else "assistant"
-            st.session_state.admin_user = "المشرف الرئيسي" if is_master else username.strip()
-            st.session_state.fails = 0
-            log_event("admin_login", st.session_state.admin_role)
-            st.rerun()
-        else:
-            st.session_state.fails = st.session_state.get("fails", 0) + 1
-            if st.session_state.fails >= 5:
-                st.session_state.lock_until = now + 60
-                st.session_state.fails = 0
-            st.error("بيانات الدخول غير صحيحة.")
-
-
-def flash(msg):
-    st.session_state["flash"] = msg
-
-
-def tab_routes():
-    routes = get_routes("approved")
-    if not routes:
-        st.info("لا توجد خطوط معتمدة حالياً.")
-        return
-    rmap = {f"#{r['id']} - {r['route_name']} ({r['fare']:.2f} د.أ)": r for r in routes}
-    r = rmap[st.selectbox("اختر المسار:", list(rmap.keys()))]
-    coords = json.loads(r["coordinates"])
-    stops = json.loads(r["stops"]) if r.get("stops") else None
-
-    if r.get("geometry_source") == "straight":
-        st.warning("هذا المسار خط مستقيم تقريبي. اضغط «إعادة حساب المسار» عند توفر الاتصال.")
-    if st.checkbox("عرض المسار على الخريطة", key=f"prev_{r['id']}"):
-        st_folium(route_map(coords, stops, r["university"]), width=900, height=380,
-                  key=f"adm_prev_{r['id']}", returned_objects=[])
-
-    with st.form(f"edit_form_{r['id']}"):
-        c1, c2 = st.columns(2)
-        with c1:
-            up_name = st.text_input("اسم المسار:", value=r["route_name"])
-            up_fare = st.number_input("الأجرة المعتمدة (د.أ):", min_value=0.10, max_value=20.0,
-                                      value=float(r["fare"]), step=0.05, format="%.2f")
-        with c2:
-            up_notes = st.text_area("ملاحظات / تردد الخط:", value=r.get("notes") or "")
-        if st.form_submit_button("💾 حفظ التعديلات"):
-            update_route(r["id"], up_name, up_fare, up_notes)
-            flash("✅ تم تحديث بيانات المسار.")
-            st.rerun()
-
-    if r.get("stops"):
-        if st.button("🔄 إعادة حساب المسار على الطرق", key=f"recalc_{r['id']}"):
-            with st.spinner("جارٍ الحساب..."):
-                src = recalc_route(r)
-            flash("✅ تم تحديث المسار." if src == "osrm" else "⚠️ تعذّر الاتصال بخدمة الطرق، أُعيد خط مستقيم.")
-            st.rerun()
-    else:
-        st.caption("هذا خط قديم بلا نقاط محفوظة، لذا لا يمكن إعادة حسابه تلقائياً.")
-
-    st.divider()
-    st.subheader("⚠️ إزالة المسار نهائياً")
-    confirm = st.checkbox("تأكيد الحذف النهائي", key=f"c_del_{r['id']}")
-    if st.button("🗑️ حذف المسار", key=f"btn_del_{r['id']}", type="primary"):
-        if confirm:
-            delete_route(r["id"])
-            flash(f"✅ تم حذف مسار '{r['route_name']}'.")
-            st.rerun()
-        else:
-            st.warning("فعّل علامة التأكيد أولاً.")
-
-
-def tab_pending():
-    pending = get_routes("pending")
-    if not pending:
-        st.success("لا توجد طلبات معلقة.")
-        return
-    for req in pending:
-        with st.expander(f"طلب #{req['id']}: {req['route_name']} — {req['university']}"):
-            st.write(f"المسافة: {req['distance_km']} كم | الزمن: {req['duration_min']} دقيقة")
-            st.write(f"ملاحظات: {req.get('notes') or 'لا يوجد'}")
-            if req.get("geometry_source") == "straight":
-                st.warning("المسار خط مستقيم تقريبي (تعذّر الاتصال بخدمة الطرق).")
-                if req.get("stops") and st.button("🔄 إعادة حساب المسار", key=f"prc_{req['id']}"):
-                    recalc_route(req)
-                    st.rerun()
-            if st.checkbox("عرض المسار المقترح", key=f"pv_{req['id']}"):
-                stops = json.loads(req["stops"]) if req.get("stops") else None
-                st_folium(route_map(json.loads(req["coordinates"]), stops, req["university"]),
-                          width=800, height=350, key=f"pvmap_{req['id']}", returned_objects=[])
-            new_name = st.text_input("اسم الخط:", value=req["route_name"], key=f"pn_{req['id']}")
-            fare = st.number_input("السعر المعتمد النهائي (د.أ):", min_value=0.10, value=float(req["fare"]),
-                                   step=0.05, format="%.2f", key=f"p_fare_{req['id']}")
-            ca, cr = st.columns(2)
-            with ca:
-                if st.button("✅ اعتماد الخط", key=f"acc_{req['id']}"):
-                    update_route(req["id"], new_name, fare, req.get("notes"))
-                    set_route_status(req["id"], "approved")
-                    flash("✅ تم اعتماد الخط.")
-                    st.rerun()
-            with cr:
-                if st.button("❌ رفض وحذف", key=f"rej_{req['id']}"):
-                    delete_route(req["id"])
-                    flash("تم رفض المقترح.")
-                    st.rerun()
-
-
-def tab_add():
-    hubs = get_all_hubs()
-    names = list(hubs.keys())
-    with st.form("admin_add_route"):
-        a_name = st.text_input("اسم الخط:")
-        a_uni = st.selectbox("الجامعة:", UNIVERSITIES)
-        a_fare = st.number_input("السعر المعتمد (د.أ):", min_value=0.10, value=0.60, step=0.05, format="%.2f")
-        a_notes = st.text_area("تفاصيل وملاحظات:")
-        c1, c2 = st.columns(2)
-        with c1:
-            a_start = st.selectbox("نقطة الانطلاق:", names, index=0)
-        with c2:
-            a_end = st.selectbox("نقطة الوصول:", names, index=min(1, len(names) - 1))
-        a_via = st.multiselect("محطات وسيطة (اختياري، بالترتيب):", names)
-        ok = st.form_submit_button("إضافة الخط فوراً")
-    if ok:
-        if a_name.strip() and a_start != a_end:
-            stops = [{"name": n, "lat": hubs[n][0], "lon": hubs[n][1]} for n in [a_start] + a_via + [a_end]]
-            with st.spinner("جارٍ حساب المسار..."):
-                src = save_route(a_name.strip(), a_uni, a_fare, stops, a_notes, "approved")
-            flash("✅ تمت إضافة المسار." + ("" if src == "osrm" else " ⚠️ رُسم كخط مستقيم لتعذّر الاتصال بخدمة الطرق."))
-            st.rerun()
-        else:
-            st.error("اكتب اسم الخط واختر محطتين مختلفتين.")
-
-
-def tab_hubs():
-    """للمشرف الرئيسي فقط: تعديل مواقع المجمعات بالنقر على الخريطة أو بخطوط الطول والعرض."""
-    hubs = get_all_hubs()
-    names = list(hubs.keys())
-    st.caption("اختر محطة ثم انقر على الخريطة لتحديد موقعها الجديد بدقة، أو اكتب الإحداثيات يدوياً. "
-               "عند الحفظ تُعاد تلقائياً حسابات كل الخطوط التي تمر بهذه المحطة.")
-    sel = st.selectbox("اختر المحطة / المجمع:", names, key="hub_sel")
-    click = st.session_state.get("hub_click")
-
-    m = base_map(center=hubs[sel], zoom=12)
-    add_hub_markers(m, hubs, highlight=sel)
-    if click:
-        folium.Marker(click, tooltip="الموقع الجديد المحدد",
-                      icon=folium.Icon(color="green", icon="map-marker", prefix="fa")).add_to(m)
-    data = st_folium(m, width=900, height=430, key=f"hub_map_{sel}", returned_objects=["last_clicked"])
-    c = new_click(data, "hub_click_seen")
-    if c:
-        st.session_state.hub_click = c
-        st.rerun()
-    click = st.session_state.get("hub_click")
-
-    cur_lat, cur_lon = hubs[sel]
-    d_lat, d_lon = click if click else (cur_lat, cur_lon)
-    if click:
-        st.info(f"النقطة المحددة على الخريطة: {click[0]:.6f} ، {click[1]:.6f}")
-        if st.button("مسح التحديد"):
-            st.session_state.hub_click = None
-            st.rerun()
-
-    col_edit, col_new = st.columns(2)
-    with col_edit:
-        st.markdown("#### ✏️ تعديل إحداثيات المحطة المختارة")
-        with st.form("edit_hub_form"):
-            lat = st.number_input("خط العرض (Latitude):", value=float(d_lat), format="%.6f", step=0.0001)
-            lon = st.number_input("خط الطول (Longitude):", value=float(d_lon), format="%.6f", step=0.0001)
-            if st.form_submit_button("💾 تحديث الإحداثيات"):
-                if not is_within_jordan(lat, lon):
-                    st.error("❌ الإحداثيات خارج حدود الأردن.")
+        if submitted:
+            if input_type == "اختيار محطات ومجمعات جاهزة":
+                if start_hub == end_hub:
+                    st.error("نقطة الانطلاق والوصول متطابقتان، اختر نقطتين مختلفتين.")
                 else:
-                    upsert_hub(sel, lat, lon)
-                    with st.spinner("جارٍ تحديث الخطوط المرتبطة..."):
-                        n = recalc_routes_using_hub(sel)
-                    st.session_state.hub_click = None
-                    flash(f"✅ تم تحديث '{sel}'، وأُعيد حساب {n} خط/خطوط مرتبطة.")
-                    st.rerun()
-    with col_new:
-        st.markdown("#### ➕ إضافة مجمع / محطة جديدة")
-        with st.form("add_hub_form"):
-            n_name = st.text_input("اسم المجمع أو النقطة:")
-            n_lat = st.number_input("خط العرض:", value=float(click[0]) if click else 32.5500, format="%.6f", step=0.0001)
-            n_lon = st.number_input("خط الطول:", value=float(click[1]) if click else 35.8500, format="%.6f", step=0.0001)
-            if st.form_submit_button("➕ حفظ المحطة"):
-                if not n_name.strip():
-                    st.warning("اكتب اسم المحطة.")
-                elif n_name.strip() in hubs:
-                    st.error("الاسم موجود مسبقاً؛ استخدم نموذج التعديل.")
-                elif not is_within_jordan(n_lat, n_lon):
-                    st.error("❌ الإحداثيات خارج حدود الأردن.")
-                else:
-                    upsert_hub(n_name.strip(), n_lat, n_lon)
-                    st.session_state.hub_click = None
-                    flash(f"✅ تمت إضافة '{n_name.strip()}'.")
-                    st.rerun()
-
-    with st.expander("جدول كل المحطات وإحداثياتها"):
-        st.dataframe(pd.DataFrame([{"المحطة": k, "Lat": v[0], "Lon": v[1]} for k, v in hubs.items()]),
-                     use_container_width=True)
-
-
-def tab_assistants():
-    """للمشرف الرئيسي فقط: إضافة وإدارة المساعدين."""
-    admins = list_admins()
-    if admins:
-        st.dataframe(pd.DataFrame(admins).rename(columns={"id": "#", "username": "اسم المستخدم", "created_at": "تاريخ الإضافة"}),
-                     use_container_width=True, hide_index=True)
-    else:
-        st.info("لا يوجد مساعدون بعد.")
-
-    st.markdown("#### ➕ إضافة مساعد آدمن")
-    with st.form("add_asst", clear_on_submit=True):
-        u = st.text_input("اسم المستخدم:")
-        p1 = st.text_input("كلمة المرور (8 أحرف فأكثر):", type="password")
-        p2 = st.text_input("تأكيد كلمة المرور:", type="password")
-        if st.form_submit_button("إضافة"):
-            u = u.strip()
-            if len(u) < 3 or " " in u:
-                st.error("اسم المستخدم 3 أحرف على الأقل وبدون مسافات.")
-            elif len(p1) < 8:
-                st.error("كلمة المرور قصيرة (8 أحرف على الأقل).")
-            elif p1 != p2:
-                st.error("كلمتا المرور غير متطابقتين.")
-            elif not add_admin(u, p1):
-                st.error("اسم المستخدم موجود مسبقاً.")
+                    s_lat, s_lon = hubs_dict[start_hub]
+                    e_lat, e_lon = hubs_dict[end_hub]
             else:
-                flash(f"✅ تمت إضافة المساعد '{u}'.")
-                st.rerun()
+                if not st.session_state.user_start_pin or not st.session_state.user_end_pin:
+                    st.error("يرجى النقر على الخريطة لتثبيت دبوس البداية ودبوس النهاية.")
+                else:
+                    s_lat, s_lon = st.session_state.user_start_pin
+                    e_lat, e_lon = st.session_state.user_end_pin
 
-    if admins:
-        st.divider()
-        target = st.selectbox("اختر مساعداً:", [a["username"] for a in admins])
-        c1, c2 = st.columns(2)
-        with c1:
-            with st.form("reset_pw", clear_on_submit=True):
-                np_ = st.text_input("كلمة مرور جديدة:", type="password")
-                if st.form_submit_button("🔑 تغيير كلمة المرور"):
-                    if len(np_) < 8:
-                        st.error("كلمة المرور قصيرة.")
-                    else:
-                        set_admin_pw(target, np_)
-                        flash(f"✅ تم تغيير كلمة مرور '{target}'.")
-                        st.rerun()
-        with c2:
-            ok = st.checkbox("تأكيد حذف المساعد", key=f"del_as_{target}")
-            if st.button("🗑️ حذف المساعد", type="primary"):
-                if ok:
-                    delete_admin(target)
-                    flash(f"✅ تم حذف '{target}'.")
+            if s_lat and e_lat:
+                if not name:
+                    st.warning("يرجى إدخال اسم المسار.")
+                elif not is_within_jordan(s_lat, s_lon) or not is_within_jordan(e_lat, e_lon):
+                    st.error("❌ النقاط المحددة تقع خارج حدود الأردن.")
+                else:
+                    dist, dur, pts = fetch_osrm_route(s_lat, s_lon, e_lat, e_lon)
+                    add_route(name, uni, suggested_fare, dist, dur, json.dumps(pts), notes, status='pending')
+                    st.session_state.user_start_pin = None
+                    st.session_state.user_end_pin = None
+                    st.success("✅ تم إرسال المقترح بنجاح لمراجعة واعتماد الإدارة.")
+
+# 3. بوابة الإدارة والتحكم
+elif app_mode == "بوابة الإدارة":
+    st.title("🔒 بوابة الإدارة والتحكم")
+    
+    if "admin_logged_in" not in st.session_state:
+        st.session_state.admin_logged_in = False
+        st.session_state.admin_role = None
+
+    if not st.session_state.admin_logged_in:
+        role_choice = st.radio("رتبة الدخول:", ["مساعد آدمن (Assistant)", "الآدمن الرئيسي (Master Admin)"], horizontal=True)
+        pwd = st.text_input("كلمة المرور الإدارية:", type="password")
+        
+        if st.button("تسجيل الدخول"):
+            master_secret = st.secrets.get("ADMIN_PASSWORD", "Desert#94-Galaxy!Amman_82")
+            asst_secret = st.secrets.get("ASST_PASSWORD", "Asst@Sha3tala#2026")
+            
+            if role_choice == "الآدمن الرئيسي (Master Admin)":
+                if pwd == master_secret:
+                    st.session_state.admin_logged_in = True
+                    st.session_state.admin_role = "master"
                     st.rerun()
                 else:
-                    st.warning("فعّل التأكيد أولاً.")
+                    st.error("كلمة مرور الآدمن الرئيسي غير صحيحة.")
+            elif role_choice == "مساعد آدمن (Assistant)":
+                if pwd == asst_secret:
+                    st.session_state.admin_logged_in = True
+                    st.session_state.admin_role = "assistant"
+                    st.rerun()
+                else:
+                    st.error("كلمة مرور المساعد غير صحيحة.")
+    else:
+        st.sidebar.success(f"مرحباً بك ({'الآدمن الرئيسي' if st.session_state.admin_role == 'master' else 'مساعد'})")
+        if st.sidebar.button("تسجيل الخروج"):
+            st.session_state.admin_logged_in = False
+            st.session_state.admin_role = None
+            st.rerun()
 
+        tabs_list = [
+            "🛠️ تعديل أسعار وإدارة المسارات", 
+            "⏳ تدقيق الطلبات الجديدة", 
+            "➕ إضافة مسار مباشر"
+        ]
+        if st.session_state.admin_role == "master":
+            tabs_list.append("📍 إدارة المجمعات والإحداثيات")
 
-def tab_stats():
-    """للمشرف الرئيسي فقط: إحصائيات الزوار."""
-    conn = get_db()
-    try:
-        df = pd.read_sql_query("SELECT ts, session_id, event, detail FROM events", conn)
-    finally:
-        conn.close()
-    if df.empty:
-        st.info("لا توجد بيانات بعد.")
-        return
+        tabs = st.tabs(tabs_list)
 
-    df["date"] = df["ts"].str[:10]
-    today = datetime.now(JO_TZ).date()
-    visits = df[df["event"] == "visit"]
-    week_start = (today - timedelta(days=6)).isoformat()
+        with tabs[0]:
+            st.subheader("تعديل الأجرة والبيانات أو إزالة المسار")
+            routes = get_routes('approved')
+            if routes:
+                r_map = {f"#{r['id']} - {r['route_name']} (السعر الحالي: {r['fare']:.2f} د.أ)": r for r in routes}
+                sel_lbl = st.selectbox("اختر المسار للتعديل أو الحذف:", list(r_map.keys()))
+                sel_r = r_map[sel_lbl]
+                
+                with st.form(f"edit_form_{sel_r['id']}"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        up_name = st.text_input("اسم المسار:", value=sel_r['route_name'])
+                        up_fare = st.number_input(
+                            "الأجرة المعتمدة (د.أ):", 
+                            min_value=0.10, 
+                            max_value=20.0, 
+                            value=float(sel_r['fare']), 
+                            step=0.05, 
+                            format="%.2f"
+                        )
+                    with col2:
+                        up_notes = st.text_area("ملاحظات / تردد الخط:", value=sel_r.get('notes') or "")
+                    
+                    btn_save = st.form_submit_button("💾 حفظ التعديلات وتحديث السعر")
+                    if btn_save:
+                        update_route_fare_and_details(sel_r['id'], up_fare, up_name, up_notes)
+                        st.success("✅ تم تحديث بيانات المسار والسعر بنجاح!")
+                        st.rerun()
+                
+                st.divider()
+                st.subheader("⚠️ خيار إزالة المسار نهائياً")
+                c_del1, c_del2 = st.columns([1, 2])
+                with c_del1:
+                    confirm_del = st.checkbox("تأكيد حذف المسار نهائياً", key=f"c_del_{sel_r['id']}")
+                with c_del2:
+                    if st.button("🗑️ إزالة المسار نهائياً من المنظومة", key=f"btn_del_{sel_r['id']}", type="primary"):
+                        if confirm_del:
+                            delete_route(sel_r['id'])
+                            st.success(f"✅ تم حذف مسار '{sel_r['route_name']}' نهائياً.")
+                            st.rerun()
+                        else:
+                            st.warning("يرجى تفعيل علامة التأكيد أولاً قبل الضغط على الحذف.")
+            else:
+                st.info("لا توجد خطوط معتمدة حالياً.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("إجمالي الزيارات", len(visits))
-    c2.metric("زيارات اليوم", int((visits["date"] == today.isoformat()).sum()))
-    c3.metric("آخر 7 أيام", int((visits["date"] >= week_start).sum()))
-    c4.metric("مشاهدات المسارات", int((df["event"] == "route_view").sum()))
+        with tabs[1]:
+            st.subheader("الطلبات المقترحة من الطلاب بانتظار الاعتماد")
+            pending = get_routes('pending')
+            if not pending:
+                st.success("لا توجد طلبات معلقة حالياً.")
+            else:
+                for req in pending:
+                    with st.expander(f"طلب: {req['route_name']} - الوجهة: {req['university']}"):
+                        st.write(f"المسافة: {req['distance_km']} كم | الزمن المقدر: {req['duration_min']} دقيقة")
+                        st.write(f"ملاحظات: {req.get('notes') or 'لا يوجد'}")
+                        
+                        app_fare = st.number_input(
+                            f"تحديد السعر المعتمد النهائي (د.أ) لطلب #{req['id']}:", 
+                            min_value=0.10, 
+                            value=float(req['fare']), 
+                            step=0.05, 
+                            format="%.2f", 
+                            key=f"p_fare_{req['id']}"
+                        )
+                        
+                        col_a, col_r = st.columns(2)
+                        with col_a:
+                            if st.button("✅ اعتماد الخط فوراً", key=f"acc_{req['id']}"):
+                                set_route_status(req['id'], 'approved', app_fare)
+                                st.success("تم اعتماد الخط بالسعر المحدد!")
+                                st.rerun()
+                        with col_r:
+                            if st.button("❌ رفض وحذف الطلب", key=f"rej_{req['id']}"):
+                                delete_route(req['id'])
+                                st.warning("تم رفض المقترح.")
+                                st.rerun()
 
-    c5, c6, c7 = st.columns(3)
-    c5.metric("مرات تشغيل المحاكاة", int((df["event"] == "simulation").sum()))
-    c6.metric("جلسات تتبع الموقع", int((df["event"] == "locate").sum()))
-    c7.metric("اقتراحات بانتظار المراجعة", len(get_routes("pending")))
+        with tabs[2]:
+            st.subheader("إضافة مسار معتمد مباشرة")
+            with st.form("admin_add_route"):
+                a_name = st.text_input("اسم الخط:")
+                a_uni = st.selectbox("الجامعة:", UNIVERSITIES)
+                a_fare = st.number_input("السعر المعتمد (د.أ):", min_value=0.10, value=0.60, step=0.05, format="%.2f")
+                a_notes = st.text_area("تفاصيل وملاحظات إضافية:")
+                
+                h_list = list(hubs_dict.keys())
+                ac1, ac2 = st.columns(2)
+                with ac1:
+                    a_start = st.selectbox("نقطة الانطلاق المعتمدة:", h_list, index=0)
+                with ac2:
+                    a_end = st.selectbox("نقطة الوصول المعتمدة:", h_list, index=min(1, len(h_list)-1))
+                
+                if st.form_submit_button("إضافة الخط فوراً إلى الخدمة"):
+                    if a_name and a_start != a_end:
+                        al1, on1 = hubs_dict[a_start]
+                        al2, on2 = hubs_dict[a_end]
+                        dist, dur, pts = fetch_osrm_route(al1, on1, al2, on2)
+                        add_route(a_name, a_uni, a_fare, dist, dur, json.dumps(pts), a_notes, status='approved')
+                        st.success("✅ تمت إضافة المسار بنجاح إلى شبكة الخطوط!")
+                        st.rerun()
+                    else:
+                        st.error("يرجى كتابة اسم الخط واختيار محطتين مختلفتين.")
 
-    st.markdown("#### الزيارات اليومية (آخر 14 يوماً)")
-    days = [(today - timedelta(days=i)).isoformat() for i in range(13, -1, -1)]
-    st.bar_chart(visits.groupby("date").size().reindex(days, fill_value=0))
+        if st.session_state.admin_role == "master":
+            with tabs[3]:
+                st.subheader("📍 إدارة إحداثيات ومواقع المجمعات والجامعات")
+                st.caption("خاص بالمشرف الرئيسي: تعديل خطوط الطول والعرض أو إضافة نقاط ومجمعات جديدة إلى النظام.")
+                
+                c_edit_hub, c_new_hub = st.columns(2)
+                with c_edit_hub:
+                    st.markdown("#### ✏️ تعديل إحداثيات محطة قائمة")
+                    selected_hub_to_edit = st.selectbox("اختر المحطة أو المجمع:", list(hubs_dict.keys()))
+                    curr_lat, curr_lon = hubs_dict[selected_hub_to_edit]
+                    
+                    with st.form("edit_hub_coords_form"):
+                        new_lat = st.number_input("خط العرض (Latitude):", value=curr_lat, format="%.6f")
+                        new_lon = st.number_input("خط الطول (Longitude):", value=curr_lon, format="%.6f")
+                        
+                        btn_update_hub = st.form_submit_button("💾 تحديث الإحداثيات")
+                        if btn_update_hub:
+                            if is_within_jordan(new_lat, new_lon):
+                                upsert_hub(selected_hub_to_edit, new_lat, new_lon)
+                                st.success(f"✅ تم تحديث إحداثيات '{selected_hub_to_edit}' بنجاح!")
+                                st.rerun()
+                            else:
+                                st.error("❌ الإحداثيات المدخلة تقع خارج حدود المملكة الأردنية الهاشمية.")
 
-    rv = df[df["event"] == "route_view"]
-    if not rv.empty:
-        st.markdown("#### أكثر المسارات مشاهدة")
-        names = {str(r["id"]): r["route_name"] for s in ("approved", "pending") for r in get_routes(s)}
-        top = rv.groupby("detail").size().sort_values(ascending=False).head(10)
-        top.index = [names.get(i, f"#{i} (محذوف)") for i in top.index]
-        st.bar_chart(top)
-
-    pv = df[df["event"] == "page"]
-    if not pv.empty:
-        st.markdown("#### مشاهدات الصفحات")
-        st.bar_chart(pv.groupby("detail").size())
-
-    st.caption("ملاحظة: يُحتسب كل فتح للتطبيق في متصفح/تبويب جديد زيارةً واحدة (جلسة)، لذا الرقم تقريبي لعدد الزوار الفعلي.")
-
-
-def page_admin():
-    if not st.session_state.get("admin_role"):
-        admin_login()
-        return
-    role = st.session_state.admin_role
-    st.title("🔒 بوابة الإدارة والتحكم")
-    st.sidebar.success(f"مرحباً {st.session_state.get('admin_user', '')} ({'آدمن رئيسي' if role == 'master' else 'مساعد'})")
-    if st.sidebar.button("تسجيل الخروج"):
-        st.session_state.admin_role = None
-        st.session_state.admin_user = None
-        st.rerun()
-
-    spec = [("🛠️ إدارة المسارات", tab_routes), ("⏳ الطلبات الجديدة", tab_pending), ("➕ إضافة مسار", tab_add)]
-    if role == "master":
-        spec += [("📍 المواقع والإحداثيات", tab_hubs), ("👥 المساعدون", tab_assistants), ("📊 إحصائيات الزوار", tab_stats)]
-    for tab, (_, fn) in zip(st.tabs([t for t, _ in spec]), spec):
-        with tab:
-            fn()
-
-
-# ───────────────────────── التشغيل ─────────────────────────
-if "sid" not in st.session_state:
-    st.session_state.sid = uuid.uuid4().hex
-    log_event("visit")
-
-st.sidebar.image("https://img.icons8.com/color/96/bus.png", width=70)
-st.sidebar.title("شعْتَلة 🚌")
-st.sidebar.caption("مسارات باصات الجامعات الأردنية")
-app_mode = st.sidebar.radio("التنقل:", [PAGE_TRACK, PAGE_SUGGEST, PAGE_ADMIN])
-
-if st.session_state.get("last_page") != app_mode:
-    st.session_state.last_page = app_mode
-    log_event("page", app_mode)
-
-if st.session_state.get("flash"):
-    st.success(st.session_state.pop("flash"))
-
-if app_mode == PAGE_TRACK:
-    page_tracking()
-elif app_mode == PAGE_SUGGEST:
-    page_suggest()
-else:
-    page_admin()
+                with c_new_hub:
+                    st.markdown("#### ➕ إضافة مجمع / محطة جديدة للنظام")
+                    with st.form("add_new_hub_form"):
+                        new_hub_name = st.text_input("اسم المجمع أو النقطة (مثال: دوار الثقافة - إربد):")
+                        add_lat = st.number_input("خط العرض:", value=32.5500, format="%.6f")
+                        add_lon = st.number_input("خط الطول:", value=35.8500, format="%.6f")
+                        
+                        btn_add_hub = st.form_submit_button("➕ حفظ وإضافة النقطة للقائمة")
+                        if btn_add_hub:
+                            if not new_hub_name:
+                                st.warning("يرجى كتابة اسم النقطة أو المجمع.")
+                            elif not is_within_jordan(add_lat, add_lon):
+                                st.error("❌ الإحداثيات المدخلة خارج حدود الأردن.")
+                            else:
+                                upsert_hub(new_hub_name, add_lat, add_lon)
+                                st.success(f"✅ تمت إضافة '{new_hub_name}' بنجاح وأصبحت متاحة فوراً لجميع المستخدمين.")
+                                st.rerun()
