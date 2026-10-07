@@ -296,7 +296,7 @@ if app_mode == "تتبع ومسارات الباصات":
         map_placeholder = st.empty()
         
         def render_bus_map(bus_position_idx=0):
-            m = folium.Map(location=coords[0], zoom_start=12, tiles="CartoDB positron")
+            m = folium.Map(location=coords[0], zoom_start=12, tiles="OpenStreetMap")
             folium.PolyLine(coords, color="#2A75D3", weight=5, opacity=0.8).add_to(m)
             folium.Marker(coords[0], tooltip="نقطة الانطلاق", icon=folium.Icon(color="green", icon="play")).add_to(m)
             folium.Marker(coords[-1], tooltip=cur_route['university'], icon=folium.Icon(color="red", icon="flag")).add_to(m)
@@ -349,7 +349,7 @@ elif app_mode == "اقتراح خط جديد":
     if input_type == "تثبيت الدبوس يدوياً على الخريطة":
         st.caption("👇 انقر على الخريطة لتثبيت الدبوس الأخضر (بداية)، ثم انقر مرة أخرى لتثبيت الدبوس الأحمر (وجهة):")
         
-        pin_map = folium.Map(location=[32.2, 35.9], zoom_start=9, tiles="CartoDB positron")
+        pin_map = folium.Map(location=[32.2, 35.9], zoom_start=9, tiles="OpenStreetMap")
         if st.session_state.user_start_pin:
             folium.Marker(st.session_state.user_start_pin, tooltip="نقطة البداية المحددة", icon=folium.Icon(color="green")).add_to(pin_map)
         if st.session_state.user_end_pin:
