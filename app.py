@@ -260,7 +260,7 @@ def fetch_osrm_route(start_lat, start_lon, end_lat, end_lon):
 
 # الشريط الجانبي
 st.sidebar.image("https://img.icons8.com/color/96/bus.png", width=70)
-st.sidebar.title("شعْتَلة 🚌")
+st.sidebar.title("شعتَلة 🚌")
 st.sidebar.caption("مسارات باصات الجامعات الأردنية")
 
 app_mode = st.sidebar.radio("التنقل:", ["تتبع ومسارات الباصات", "اقتراح خط جديد", "بوابة الإدارة"])
