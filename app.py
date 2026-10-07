@@ -1,7 +1,7 @@
 import streamlit as st
 
 st.set_page_config(
-    page_title="شعتَلة",
+    page_title="شعْتَلة",
     page_icon="🚌",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -80,6 +80,13 @@ UNIVERSITIES = [
 def use_turso():
     return HAS_TURSO and ("TURSO_DATABASE_URL" in st.secrets) and ("TURSO_AUTH_TOKEN" in st.secrets)
 
+def get_turso_client():
+    url = st.secrets["TURSO_DATABASE_URL"].strip()
+    if url.startswith("libsql://"):
+        url = url.replace("libsql://", "https://")
+    token = st.secrets["TURSO_AUTH_TOKEN"].strip()
+    return libsql_client.create_client_sync(url=url, auth_token=token)
+
 def get_db():
     conn = sqlite3.connect("masar_database.db", check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -87,16 +94,16 @@ def get_db():
 
 def db_execute(query, params=(), fetchall=False, commit=False):
     if use_turso():
-        client = libsql_client.create_client_sync(
-            url=st.secrets["TURSO_DATABASE_URL"],
-            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
-        )
-        q_clean = query.replace("?", "$?")
-        res = client.execute(query, params)
-        if fetchall:
-            cols = res.columns
-            return [dict(zip(cols, row)) for row in res.rows]
-        return None
+        try:
+            client = get_turso_client()
+            res = client.execute(query, params)
+            if fetchall:
+                cols = res.columns
+                return [dict(zip(cols, row)) for row in res.rows]
+            return None
+        except Exception as e:
+            st.error(f"خطأ أثناء الاستعلام من Turso: {e}")
+            return []
     else:
         conn = get_db()
         c = conn.cursor()
@@ -112,65 +119,69 @@ def db_execute(query, params=(), fetchall=False, commit=False):
 
 def init_db():
     if use_turso():
-        client = libsql_client.create_client_sync(
-            url=st.secrets["TURSO_DATABASE_URL"],
-            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
-        )
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS routes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                route_name TEXT NOT NULL,
-                university TEXT NOT NULL,
-                fare REAL NOT NULL,
-                distance_km REAL,
-                duration_min REAL,
-                coordinates TEXT NOT NULL,
-                notes TEXT,
-                status TEXT DEFAULT 'approved'
-            )
-        """)
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS hubs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                lat REAL NOT NULL,
-                lon REAL NOT NULL
-            )
-        """)
-        res = client.execute("SELECT COUNT(*) FROM hubs")
-        if res.rows[0][0] == 0:
-            for h in DEFAULT_HUBS:
-                client.execute("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", h)
+        try:
+            client = get_turso_client()
+            client.execute("""
+                CREATE TABLE IF NOT EXISTS routes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    route_name TEXT NOT NULL,
+                    university TEXT NOT NULL,
+                    fare REAL NOT NULL,
+                    distance_km REAL,
+                    duration_min REAL,
+                    coordinates TEXT NOT NULL,
+                    notes TEXT,
+                    status TEXT DEFAULT 'approved'
+                )
+            """)
+            client.execute("""
+                CREATE TABLE IF NOT EXISTS hubs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    lat REAL NOT NULL,
+                    lon REAL NOT NULL
+                )
+            """)
+            res = client.execute("SELECT COUNT(*) FROM hubs")
+            if res.rows[0][0] == 0:
+                for h in DEFAULT_HUBS:
+                    client.execute("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", h)
+        except Exception as e:
+            st.warning(f"تعذر الاتصال بـ Turso: {e}. جاري التحويل لقاعدة البيانات المحلية.")
+            init_local_db()
     else:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS routes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                route_name TEXT NOT NULL,
-                university TEXT NOT NULL,
-                fare REAL NOT NULL,
-                distance_km REAL,
-                duration_min REAL,
-                coordinates TEXT NOT NULL,
-                notes TEXT,
-                status TEXT DEFAULT 'approved'
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS hubs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                lat REAL NOT NULL,
-                lon REAL NOT NULL
-            )
-        """)
+        init_local_db()
+
+def init_local_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_name TEXT NOT NULL,
+            university TEXT NOT NULL,
+            fare REAL NOT NULL,
+            distance_km REAL,
+            duration_min REAL,
+            coordinates TEXT NOT NULL,
+            notes TEXT,
+            status TEXT DEFAULT 'approved'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hubs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    c.execute("SELECT COUNT(*) FROM hubs")
+    if c.fetchone()[0] == 0:
+        c.executemany("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", DEFAULT_HUBS)
         conn.commit()
-        c.execute("SELECT COUNT(*) FROM hubs")
-        if c.fetchone()[0] == 0:
-            c.executemany("INSERT OR IGNORE INTO hubs (name, lat, lon) VALUES (?, ?, ?)", DEFAULT_HUBS)
-            conn.commit()
-        conn.close()
+    conn.close()
 
 init_db()
 
@@ -180,10 +191,7 @@ def get_all_hubs():
 
 def upsert_hub(name, lat, lon):
     if use_turso():
-        client = libsql_client.create_client_sync(
-            url=st.secrets["TURSO_DATABASE_URL"],
-            auth_token=st.secrets["TURSO_AUTH_TOKEN"]
-        )
+        client = get_turso_client()
         client.execute("""
             INSERT INTO hubs (name, lat, lon) VALUES (?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon
